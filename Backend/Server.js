@@ -12,9 +12,9 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:3001",
-  "https://wb.lcind.space",
+  "https://goyclient1.onrender.com/",
+  "https://goyclient1.onrender.com/",
+"https://wb.lcind.space",
   "https://goyee.lcind.space"
 ];
 
@@ -107,7 +107,7 @@ async function startWhatsAppForUser(email) {
 
         client.ev.on('creds.update', saveCreds);
 
-    client.ev.on('connection.update', (update) => {
+    client.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
@@ -118,13 +118,46 @@ async function startWhatsAppForUser(email) {
         }
 
         if (connection === 'open') {
-            console.log(`✅ WhatsApp Authenticated for ${email}!`);
             if (userClients[email]) {
+                const scannedDigits = client.user?.id ? client.user.id.split(':')[0].replace(/\D/g, '').slice(-10) : '';
+
+                let registeredDigits = '';
+                try {
+                    const dbUser = await User.findOne({ email }, 'phone').lean();
+                    registeredDigits = dbUser && dbUser.phone ? String(dbUser.phone).replace(/\D/g, '').slice(-10) : '';
+                } catch (e) {
+                    console.error(`Could not look up registered phone for ${email}:`, e.message);
+                }
+
+                // Reject the session if the scanned WhatsApp number doesn't
+                // match the account's registered mobile number. (If no phone
+                // is on file for this account, we can't enforce this check —
+                // make the registered phone required at signup if this must
+                // always be enforced.)
+                if (registeredDigits && scannedDigits && registeredDigits !== scannedDigits) {
+                    console.warn(`⚠️ WhatsApp number mismatch for ${email}: registered ending ${registeredDigits}, scanned ending ${scannedDigits}. Rejecting session.`);
+                    emitToUserSockets(email, "number_mismatch", {
+                        message: `The WhatsApp number you scanned doesn't match your registered mobile number. Please log out and scan again using the number ending in ${registeredDigits}.`,
+                        registeredNumber: registeredDigits,
+                        scannedNumber: scannedDigits
+                    });
+                    userClients[email].latestQR = "";
+                    userClients[email].isWhatsAppAuthenticated = false;
+                    try { await client.logout(); } catch (e) { /* ignore */ }
+                    const authPath = path.join(__dirname, folderName);
+                    if (fs.existsSync(authPath)) {
+                        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+                    }
+                    delete userClients[email];
+                    return;
+                }
+
+                console.log(`✅ WhatsApp Authenticated for ${email}!`);
                 userClients[email].latestQR = ""; 
                 userClients[email].isWhatsAppAuthenticated = true;
                 
                 const userInfo = client.user ? {
-                    id: client.user.id ? client.user.id.split(':')[0] : '',
+                    id: scannedDigits,
                     name: client.user.name || client.user.verifiedName || ''
                 } : null;
                 
@@ -816,10 +849,15 @@ app.get('/api/history', async (req, res) => {
   }
 });
 
+// ==========================================
+// CONTACT FORM WHATSAPP ROUTE (UPDATED)
+// ==========================================
+
 app.post('/api/contact/whatsapp', async (req, res) => {
   try {
     const { name, email, subject, message, text } = req.body;
 
+    // --- validation (unchanged) ---
     const validationErrors = [];
     if (!name || !String(name).trim()) validationErrors.push('Please enter your full name.');
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) validationErrors.push('Please enter a valid email address.');
@@ -830,18 +868,25 @@ app.post('/api/contact/whatsapp', async (req, res) => {
       return res.status(400).json({ message: validationErrors[0] });
     }
 
-    const activeClient = Object.values(userClients).find(uc => uc.isWhatsAppAuthenticated)?.whatsappClient;
-    if (!activeClient) {
-      return res.status(503).json({ message: 'WhatsApp is not ready yet. Please try again shortly.' });
+    // --- NEW: get the client for this specific user using the email ---
+    const userClient = userClients[email];
+    if (!userClient || !userClient.isWhatsAppAuthenticated || !userClient.whatsappClient) {
+      return res.status(403).json({
+        message: 'Your WhatsApp is not connected. Please connect your WhatsApp first before sending a message.'
+      });
     }
+    const activeClient = userClient.whatsappClient;
 
+    // --- send to admin (unchanged) ---
     const destination = String(process.env.WHATSAPP_CONTACT_NUMBER || '919486042369').replace(/\D/g, '');
     if (!destination) {
       return res.status(500).json({ message: 'WhatsApp destination is not configured.' });
     }
 
     const formattedNumber = destination.startsWith('91') ? `${destination}@s.whatsapp.net` : `91${destination}@s.whatsapp.net`;
-    const payload = { text: text || `New contact form submission\nName: ${name}\nEmail: ${email}\nSubject: ${subject}\nMessage: ${message}` };
+    const payload = {
+      text: text || `New contact form submission\nName: ${name}\nEmail: ${email}\nSubject: ${subject}\nMessage: ${message}`
+    };
 
     await activeClient.sendMessage(formattedNumber, payload);
     res.status(200).json({ message: 'Contact message sent successfully.' });
