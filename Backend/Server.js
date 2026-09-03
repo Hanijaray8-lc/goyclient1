@@ -15,7 +15,9 @@ const allowedOrigins = [
   "https://goyclient1.onrender.com/",
   "https://goyclient1.onrender.com/",
 "https://wb.lcind.space",
-  "https://goyee.lcind.space"
+  "http://localhost:3000",
+  "http://localhost:5000",
+"https://goyee.lcind.space"
 ];
 
 // Socket.io CORS setup
