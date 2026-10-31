@@ -8,61 +8,53 @@ const { Server } = require('socket.io'); // Socket.io
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 require('dotenv').config();
+const { scrapeGoogleMapsLeads } = require("./scraper");
+
 
 const app = express();
 const server = http.createServer(app);
-const allowedOrigins = [
-  "http://localhost:3000",
-  "http://localhost:3001",
-  "https://goyee.lcind.space"
-];
-
 // Socket.io CORS setup
 const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ["GET", "POST"],
-    credentials: true
-  },
+  cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] },
   maxHttpBufferSize: 1e8 // 100 MB limit for videos
 });
 
-app.use(cors({
-  origin: allowedOrigins,
-  credentials: true
-}));
+app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
+const teamCampaignRoutes = require('./routes/teamCampaignRoutes');
+app.use('/api/team-campaign', teamCampaignRoutes);
+
+// Web Scraper API Endpoint
+app.post("/api/scrape-leads", async (req, res) => {
+  try {
+    const { query, location } = req.body;
+    if (!query) {
+      return res.status(400).json({ success: false, message: "Query string is required" });
+    }
+
+    console.log(`🌐 API request received for query: "${query}" in "${location || 'Any'}"`);
+    const leads = await scrapeGoogleMapsLeads(query, location || "");
+    return res.json({ success: true, count: leads.length, leads });
+  } catch (err) {
+    console.error("Scraper API Route Error:", err);
+    return res.status(500).json({ success: false, message: "Failed to scrape leads" });
+  }
+});
+
 // MongoDB connection
 mongoose.connect(process.env.MONGO_URI)
-  .then(async () => {
-    console.log("Connected to MongoDB Atlas");
-    // MongoDB TTL indexes don't auto-update their expireAfterSeconds just
-    // because the schema changed — the index already exists in the DB from
-    // before. This explicitly syncs it to whatever HISTORY_RETENTION_SECONDS
-    // is currently set to (15 min for testing, 7 days for production).
-    try {
-      const result = await mongoose.connection.db.command({
-        collMod: 'messagehistories',
-        index: {
-          keyPattern: { createdAt: 1 },
-          expireAfterSeconds: HISTORY_RETENTION_SECONDS
-        }
-      });
-      console.log(`✅ History TTL index synced to ${HISTORY_RETENTION_SECONDS}s`);
-    } catch (err) {
-      // Fails harmlessly on first-ever run before the collection/index exists —
-      // mongoose will create it fresh with the correct value in that case.
-      console.log("ℹ️ TTL index collMod skipped (likely first run / index not yet created). Full error:", err.message);
-    }
-  })
+  .then(() => console.log("Connected to MongoDB Atlas"))
   .catch((err) => console.error("MongoDB error:", err));
 
 // --- WhatsApp Logic Setup (User-Specific) ---
 const userClients = {}; // key: email, value: { whatsappClient, latestQR, isWhatsAppAuthenticated }
 const socketToEmail = {}; // key: socket.id, value: email
 const emailToSockets = {}; // key: email, value: array of socket.id
+
+app.set('userClients', userClients);
+app.set('emitToUserSockets', emitToUserSockets);
 
 function emitToUserSockets(email, event, data) {
     const socketIds = emailToSockets[email];
@@ -91,7 +83,14 @@ async function startWhatsAppForUser(email) {
     try {
         const folderName = `auth_info_${email.replace(/[^a-zA-Z0-9]/g, '_')}`;
         const { state, saveCreds } = await useMultiFileAuthState(folderName);
-        const { version } = await fetchLatestBaileysVersion();
+        let version = [2, 3000, 1015901307];
+        try {
+            const vRes = await Promise.race([
+                fetchLatestBaileysVersion(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1500))
+            ]);
+            if (vRes && vRes.version) version = vRes.version;
+        } catch(e) {}
 
         const client = makeWASocket({
             version,
@@ -273,12 +272,7 @@ io.on("connection", (socket) => {
         let validNumbersCount = 0;
         let successCount = 0;
         let failedCount = 0;
-
-        const deviceName = whatsappClient && whatsappClient.user
-            ? (whatsappClient.user.name || whatsappClient.user.verifiedName || (whatsappClient.user.id ? whatsappClient.user.id.split(':')[0] : ''))
-            : '';
-        const historyRecords = []; // collected here, written once via insertMany to avoid duplicate records
-
+        
         socket.emit("bulk_progress_start", { total: numbers.length });
 
         for (const num of numbers) {
@@ -302,53 +296,51 @@ io.on("connection", (socket) => {
                         continue; // Skip sending, move to next number
                     }
 
-                    if (media && media.data) {
-                        const buffer = Buffer.from(media.data, 'base64');
-                        let mediaMessage = {};
-                        let mime = media.mimetype ? media.mimetype.toLowerCase() : '';
-                        const name = media.filename ? media.filename.toLowerCase() : '';
-                        
-                        // Fallback mime from file extension if empty or generic octet-stream
-                        if (!mime || mime === 'application/octet-stream') {
-                            const ext = name.split('.').pop();
-                            const mimeMap = {
-                                'png': 'image/png',
-                                'jpg': 'image/jpeg',
-                                'jpeg': 'image/jpeg',
-                                'gif': 'image/gif',
-                                'webp': 'image/webp',
-                                'mp4': 'video/mp4',
-                                'mov': 'video/quicktime',
-                                'avi': 'video/x-msvideo',
-                                'pdf': 'application/pdf',
-                                'csv': 'text/csv',
-                                'xls': 'application/vnd.ms-excel',
-                                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                'doc': 'application/msword',
-                                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                'txt': 'text/plain'
-                            };
-                            mime = mimeMap[ext] || mime;
-                        }
+                    const mediaList = Array.isArray(media) ? media : (media && media.data ? [media] : []);
+                    if (mediaList.length > 0) {
+                        for (let i = 0; i < mediaList.length; i++) {
+                            const mItem = mediaList[i];
+                            if (!mItem || !mItem.data) continue;
+                            const buffer = Buffer.from(mItem.data, 'base64');
+                            let mediaMessage = {};
+                            let mime = mItem.mimetype ? mItem.mimetype.toLowerCase() : '';
+                            const name = mItem.filename ? mItem.filename.toLowerCase() : '';
+                            
+                            if (!mime || mime === 'application/octet-stream') {
+                                const ext = name.split('.').pop();
+                                const mimeMap = {
+                                    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp',
+                                    'mp4': 'video/mp4', 'mov': 'video/quicktime', 'pdf': 'application/pdf', 'csv': 'text/csv',
+                                    'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'txt': 'text/plain'
+                                };
+                                mime = mimeMap[ext] || mime;
+                            }
 
-                        const isImage = mime.startsWith('image/') || name.match(/\.(jpg|jpeg|png|gif|webp)$/);
-                        const isVideo = mime.startsWith('video/') || name.match(/\.(mp4|mov|avi|webm|mkv)$/);
+                            const isImage = mime.startsWith('image/') || name.match(/\.(jpg|jpeg|png|gif|webp)$/);
+                            const isVideo = mime.startsWith('video/') || name.match(/\.(mp4|mov|avi|webm|mkv)$/);
+                            const isAudio = mime.startsWith('audio/') || name.match(/\.(mp3|wav|ogg|m4a|aac|opus)$/);
 
-                        if (isImage) {
-                            mediaMessage = { image: buffer, caption: text, mimetype: mime || 'image/jpeg' };
-                        } else if (isVideo) {
-                            mediaMessage = { video: buffer, caption: text, mimetype: mime || 'video/mp4' };
-                        } else {
-                            mediaMessage = { document: buffer, caption: text, mimetype: mime || 'application/octet-stream', fileName: media.filename || 'document' };
+                            // Send caption only with the last file or text if provided
+                            const currentCaption = (i === mediaList.length - 1) ? text : '';
+
+                            if (isImage) {
+                                mediaMessage = { image: buffer, caption: currentCaption, mimetype: mime || 'image/jpeg' };
+                            } else if (isVideo) {
+                                mediaMessage = { video: buffer, caption: currentCaption, mimetype: mime || 'video/mp4' };
+                            } else if (isAudio) {
+                                mediaMessage = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+                            } else {
+                                mediaMessage = { document: buffer, caption: currentCaption, mimetype: mime || 'application/octet-stream', fileName: mItem.filename || 'document' };
+                            }
+                            await whatsappClient.sendMessage(formattedNumber, mediaMessage);
+                            if (i < mediaList.length - 1) await new Promise(r => setTimeout(r, 500));
                         }
-                        await whatsappClient.sendMessage(formattedNumber, mediaMessage);
                     } else {
                         await whatsappClient.sendMessage(formattedNumber, { text: text });
                     }
                     console.log(`✅ Message sent to ${num}`);
                     socket.emit("bulk_progress_update", { status: "sent", number: num });
                     successCount++;
-                    historyRecords.push({ email, deviceName, phone: String(num), message: text || (media ? `[${media.filename || 'attachment'}]` : ''), status: 'Sent', sentAt: new Date() });
                     await new Promise(resolve => setTimeout(resolve, 2000));
                 } catch (error) {
                     console.error(`❌ Failed to send to ${num}`, error);
@@ -364,7 +356,6 @@ io.on("connection", (socket) => {
 
                     socket.emit("bulk_progress_update", { status: "failed", number: num, reason: reason });
                     failedCount++;
-                    historyRecords.push({ email, deviceName, phone: String(num), message: text || (media ? `[${media.filename || 'attachment'}]` : ''), status: 'Failed', reason, sentAt: new Date() });
                 }
             } else {
                 if (num) {
@@ -387,22 +378,43 @@ io.on("connection", (socket) => {
             );
         }
 
-        // Record each recipient's send attempt into History (one write per bulk send, not per number, so no duplicates)
-        if (historyRecords.length > 0) {
-            try {
-                await MessageHistory.insertMany(historyRecords, { ordered: false });
-            } catch (histErr) {
-                console.error("⚠️ Failed to save message history:", histErr.message);
-            }
-        }
-
         socket.emit("bulk_progress_completed", { success: true });
 
         if (typeof callback === "function") {
             callback({ success: true });
         }
     });
+
+    // ── Progressive Web Scraper via Socket.IO ──────────────────────────────
+    // The frontend emits "start_scrape" → backend streams results back via
+    // "scrape_lead", "scrape_phone_update", and "scrape_complete" events.
+    socket.on("start_scrape", async ({ query, location }) => {
+      if (!query) {
+        socket.emit("scrape_error", { message: "Search query is required." });
+        return;
+      }
+      console.log(`🌐 [Socket] Scrape request: "${query}" in "${location || "Any"}"`);
+
+      try {
+        await scrapeGoogleMapsLeads(query, location || "", {
+          onLead: (lead) => {
+            socket.emit("scrape_lead", lead);
+          },
+          onPhoneUpdate: (id, phone) => {
+            socket.emit("scrape_phone_update", { id, phone });
+          },
+          onComplete: (leads) => {
+            socket.emit("scrape_complete", { count: leads.length });
+          }
+        });
+      } catch (err) {
+        console.error("❌ [Socket Scrape Error]:", err.message);
+        socket.emit("scrape_error", { message: err.message || "Scraping failed. Try a different search." });
+      }
+    });
 });
+
+
 
 
 
@@ -474,10 +486,6 @@ function scheduleJob(scheduleDoc) {
             let validNumbersCount = 0;
             let successCount = 0;
             let failedCount = 0;
-            const deviceName = whatsappClient && whatsappClient.user
-                ? (whatsappClient.user.name || whatsappClient.user.verifiedName || (whatsappClient.user.id ? whatsappClient.user.id.split(':')[0] : ''))
-                : '';
-            const historyRecords = [];
  
             io.emit("bulk_progress_start", { total: scheduleDoc.contacts.length });
  
@@ -505,52 +513,50 @@ function scheduleJob(scheduleDoc) {
                         continue;
                     }
  
-                    if (scheduleDoc.media && scheduleDoc.media.data) {
-                        const buffer = Buffer.from(scheduleDoc.media.data, 'base64');
-                        let mediaMessage = {};
-                        let mime = scheduleDoc.media.mimetype ? scheduleDoc.media.mimetype.toLowerCase() : '';
-                        const name = scheduleDoc.media.filename ? scheduleDoc.media.filename.toLowerCase() : '';
-                        
-                        // Fallback mime from file extension if empty or generic octet-stream
-                        if (!mime || mime === 'application/octet-stream') {
-                            const ext = name.split('.').pop();
-                            const mimeMap = {
-                                'png': 'image/png',
-                                'jpg': 'image/jpeg',
-                                'jpeg': 'image/jpeg',
-                                'gif': 'image/gif',
-                                'webp': 'image/webp',
-                                'mp4': 'video/mp4',
-                                'mov': 'video/quicktime',
-                                'avi': 'video/x-msvideo',
-                                'pdf': 'application/pdf',
-                                'csv': 'text/csv',
-                                'xls': 'application/vnd.ms-excel',
-                                'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                'doc': 'application/msword',
-                                'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-                                'txt': 'text/plain'
-                            };
-                            mime = mimeMap[ext] || mime;
+                    const rawMedia = scheduleDoc.media;
+                    const mediaList = Array.isArray(rawMedia) ? rawMedia : (rawMedia && (rawMedia.data || rawMedia.length) ? (Array.isArray(rawMedia) ? rawMedia : [rawMedia]) : []);
+                    if (mediaList.length > 0) {
+                        for (let i = 0; i < mediaList.length; i++) {
+                            const mItem = mediaList[i];
+                            if (!mItem || !mItem.data) continue;
+                            const buffer = Buffer.from(mItem.data, 'base64');
+                            let mediaMessage = {};
+                            let mime = mItem.mimetype ? mItem.mimetype.toLowerCase() : '';
+                            const name = mItem.filename ? mItem.filename.toLowerCase() : '';
+                            
+                            if (!mime || mime === 'application/octet-stream') {
+                                const ext = name.split('.').pop();
+                                const mimeMap = {
+                                    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp',
+                                    'mp4': 'video/mp4', 'mov': 'video/quicktime', 'pdf': 'application/pdf', 'csv': 'text/csv',
+                                    'doc': 'application/msword', 'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'txt': 'text/plain'
+                                };
+                                mime = mimeMap[ext] || mime;
+                            }
+
+                            const isImage = mime.startsWith('image/') || name.match(/\.(jpg|jpeg|png|gif|webp)$/);
+                            const isVideo = mime.startsWith('video/') || name.match(/\.(mp4|mov|avi|webm|mkv)$/);
+                            const isAudio = mime.startsWith('audio/') || name.match(/\.(mp3|wav|ogg|m4a|aac|opus)$/);
+
+                            const currentCaption = (i === mediaList.length - 1) ? scheduleDoc.message : '';
+
+                            if (isImage) {
+                                mediaMessage = { image: buffer, caption: currentCaption, mimetype: mime || 'image/jpeg' };
+                            } else if (isVideo) {
+                                mediaMessage = { video: buffer, caption: currentCaption, mimetype: mime || 'video/mp4' };
+                            } else if (isAudio) {
+                                mediaMessage = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+                            } else {
+                                mediaMessage = { document: buffer, caption: currentCaption, mimetype: mime || 'application/octet-stream', fileName: mItem.filename || 'document' };
+                            }
+                            await whatsappClient.sendMessage(formattedNumber, mediaMessage);
+                            if (i < mediaList.length - 1) await new Promise(r => setTimeout(r, 500));
                         }
- 
-                        const isImage = mime.startsWith('image/') || name.match(/\.(jpg|jpeg|png|gif|webp)$/);
-                        const isVideo = mime.startsWith('video/') || name.match(/\.(mp4|mov|avi|webm|mkv)$/);
- 
-                        if (isImage) {
-                            mediaMessage = { image: buffer, caption: scheduleDoc.message, mimetype: mime || 'image/jpeg' };
-                        } else if (isVideo) {
-                            mediaMessage = { video: buffer, caption: scheduleDoc.message, mimetype: mime || 'video/mp4' };
-                        } else {
-                            mediaMessage = { document: buffer, caption: scheduleDoc.message, mimetype: mime || 'application/octet-stream', fileName: scheduleDoc.media.filename || 'document' };
-                        }
-                        await whatsappClient.sendMessage(formattedNumber, mediaMessage);
                     } else {
                         await whatsappClient.sendMessage(formattedNumber, { text: scheduleDoc.message });
                     }
                     io.emit("bulk_progress_update", { status: "sent", number: num });
                     successCount++;
-                    historyRecords.push({ email, deviceName, phone: String(num), message: scheduleDoc.message || (scheduleDoc.media ? `[${scheduleDoc.media.filename || 'attachment'}]` : ''), status: 'Sent', sentAt: new Date() });
                     await new Promise(resolve => setTimeout(resolve, 2000));
                 } catch(e) {
                     console.error('Error sending scheduled to', num, e);
@@ -560,7 +566,6 @@ function scheduleJob(scheduleDoc) {
                     }
                     io.emit("bulk_progress_update", { status: "failed", number: num, reason: reason });
                     failedCount++;
-                    historyRecords.push({ email, deviceName, phone: String(num), message: scheduleDoc.message || (scheduleDoc.media ? `[${scheduleDoc.media.filename || 'attachment'}]` : ''), status: 'Failed', reason, sentAt: new Date() });
                 }
             }
  
@@ -573,14 +578,6 @@ function scheduleJob(scheduleDoc) {
                     { $inc: { count: validNumbersCount, successCount: successCount, failedCount: failedCount } },
                     { upsert: true, new: true }
                 );
-            }
-
-            if (historyRecords.length > 0) {
-                try {
-                    await MessageHistory.insertMany(historyRecords, { ordered: false });
-                } catch (histErr) {
-                    console.error("⚠️ Failed to save message history (scheduled):", histErr.message);
-                }
             }
  
             io.emit("bulk_progress_completed", { success: true });
@@ -620,7 +617,9 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true },
   phone: { type: String, required: false },
   location: { type: String, required: false },
-  totalSent: { type: Number, default: 0 }
+  credits: { type: Number, default: 0 },
+  totalSent: { type: Number, default: 0 },
+  lastDailyRewardDate: { type: String, default: "" }
 });
 
 const messageLogSchema = new mongoose.Schema({
@@ -630,73 +629,27 @@ const messageLogSchema = new mongoose.Schema({
   failedCount: { type: Number, default: 0 }
 });
 
-// --- Message History (auto-expiring log of every send attempt) ---
-// ⚙️ TESTING MODE: retention is currently 15 MINUTES instead of 7 days.
-// To restore production behavior, comment out the "testing" line and
-// uncomment the "production" line below — nothing else needs to change,
-// since everything downstream just reads HISTORY_RETENTION_SECONDS.
-// const HISTORY_RETENTION_SECONDS = 15 * 60;        // ← TESTING: 15 minutes
-const HISTORY_RETENTION_SECONDS = 7 * 24 * 60 * 60; // ← PRODUCTION: 7 days
-
-const messageHistorySchema = new mongoose.Schema({
-  email: { type: String, required: true }, // user/device identifier
-  deviceName: { type: String },   // connected WhatsApp device/user info, if available
-  phone: { type: String, required: true },
-  message: { type: String, default: "" },
-  status: { type: String, enum: ['Sent', 'Failed'], required: true },
-  reason: { type: String },       // failure reason, if any
-  sentAt: { type: Date, default: Date.now },
-  createdAt: { type: Date, default: Date.now }
-});
-// Single compound index used for both lookups and the 7-day TTL cleanup —
-// avoids defining two separate indexes on overlapping fields, which is
-// what causes an IndexOptionsConflict if a collection already exists.
-messageHistorySchema.index({ email: 1, createdAt: -1 });
-messageHistorySchema.index({ createdAt: 1 }, { expireAfterSeconds: HISTORY_RETENTION_SECONDS });
-
 // Avoid OverwriteModelError if it's already defined
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const MessageLog = mongoose.models.MessageLog || mongoose.model('MessageLog', messageLogSchema);
-const MessageHistory = mongoose.models.MessageHistory || mongoose.model('MessageHistory', messageHistorySchema);
-
-// --- Backup cleanup loop ---
-// MongoDB's own TTL background thread handles deletion automatically, but it
-// only sweeps roughly once every 60 seconds and can occasionally lag,
-// especially right after an index's expireAfterSeconds value has just been
-// changed (as during this 15-minute testing setup). This app-level interval
-// runs the exact same deletion explicitly and logs what it removes, so you
-// can see and trust that cleanup is actually happening — it never touches
-// User.totalSent, so the Overall Message Count is always unaffected.
-setInterval(async () => {
-  try {
-    const cutoff = new Date(Date.now() - HISTORY_RETENTION_SECONDS * 1000);
-    const result = await MessageHistory.deleteMany({ createdAt: { $lt: cutoff } });
-    if (result.deletedCount > 0) {
-      console.log(`🧹 Backup cleanup: removed ${result.deletedCount} expired history record(s) older than ${HISTORY_RETENTION_SECONDS}s`);
-    }
-  } catch (err) {
-    console.error("Backup history cleanup error:", err.message);
-  }
-}, 60 * 1000); // check every 60 seconds
-
-// Surface index-build errors (e.g. a conflicting index left over from an
-// earlier run) instead of letting them fail silently in the background.
-MessageHistory.on('index', (err) => {
-  if (err) {
-    console.error('❌ MessageHistory index build failed:', err.message);
-    console.error('   If this mentions "IndexOptionsConflict" or "IndexKeySpecsConflict", drop the old index once with:');
-    console.error('   db.messagehistories.dropIndexes()  (run in mongosh / MongoDB Compass), then restart the server.');
-  }
-});
 
 app.post('/api/register', async (req, res) => {
   try {
     const { name, email, password, phone, location } = req.body;
     const existingUser = await User.findOne({ email });
     if (existingUser) return res.status(400).json({ message: "User already exists" });
+    
+    // Explicitly set 30 credits and today's date so they don't get another 30 on login
+    const d = new Date();
+    const offset = d.getTimezoneOffset() * 60000;
+    const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
 
-    const newUser = new User({ name, email, password, phone, location });
-
+    const newUser = new User({ 
+      name, email, password, phone, location,
+      credits: 30,
+      lastDailyRewardDate: today
+    });
+    
     await newUser.save();
     res.status(201).json({ message: "Registration successful!" });
   } catch (error) {
@@ -709,14 +662,26 @@ app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
     const user = await User.findOne({ email, password });
     if (!user) return res.status(401).json({ message: "Invalid email or password" });
+    
+    // Daily Credit Reward Logic
+    const d = new Date();
+    const offset = d.getTimezoneOffset() * 60000;
+    const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
 
-    res.status(200).json({
-      message: "Login successful!",
-      name: user.name,
-      email: user.email,
-      phone: user.phone || "",
-      location: user.location || "",
-      totalSent: user.totalSent || 0
+    if (user.lastDailyRewardDate !== today) {
+      user.credits = (user.credits || 0) + 30;
+      user.lastDailyRewardDate = today;
+      await user.save();
+    }
+
+    res.status(200).json({ 
+      message: "Login successful!", 
+      name: user.name, 
+      email: user.email, 
+      phone: user.phone || "", 
+      location: user.location || "", 
+      credits: user.credits,
+      totalSent: user.totalSent || 0 
     });
   } catch (error) {
     res.status(500).json({ message: "Error logging in", error });
@@ -751,6 +716,30 @@ app.get('/api/messages/stats', async (req, res) => {
   }
 });
 
+app.post('/api/user/credits', async (req, res) => {
+  try {
+    const { email } = req.body;
+    let user = await User.findOne({ email });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    const d = new Date();
+    const offset = d.getTimezoneOffset() * 60000;
+    const today = new Date(d.getTime() - offset).toISOString().split('T')[0];
+
+    let rewarded = false;
+    if (user.lastDailyRewardDate !== today) {
+      user.credits = (user.credits || 0) + 30;
+      user.lastDailyRewardDate = today;
+      await user.save();
+      rewarded = true;
+    }
+
+    res.status(200).json({ credits: user.credits, totalSent: user.totalSent || 0, rewarded, lastDailyRewardDate: user.lastDailyRewardDate });
+  } catch (error) {
+    res.status(500).json({ message: "Error fetching credits", error });
+  }
+});
+
 app.post('/api/user/increment-sent', async (req, res) => {
   try {
     const { email } = req.body;
@@ -767,51 +756,19 @@ app.post('/api/user/increment-sent', async (req, res) => {
   }
 });
 
-// GET /api/user/total-sent?email=user@example.com
-// Returns the permanent, cumulative "Overall Message Count" for a user.
-// This value lives on the User document (not MessageHistory), so it is
-// never affected by the 7-day TTL cleanup of history records.
-app.get('/api/user/total-sent', async (req, res) => {
+app.post('/api/user/use-credit', async (req, res) => {
   try {
-    const { email } = req.query;
-    if (!email) return res.status(400).json({ message: "email is required" });
-
-    const user = await User.findOne({ email }, 'totalSent').lean();
-    if (!user) return res.status(404).json({ message: "User not found" });
-
-    res.status(200).json({ totalSent: user.totalSent || 0 });
-  } catch (error) {
-    res.status(500).json({ message: "Error fetching total sent", error: error.message });
-  }
-});
-
-// ==========================================
-// MESSAGE HISTORY API ROUTES (7-day retention, auto-cleaned via MongoDB TTL index)
-// ==========================================
-
-// GET /api/history?email=user@example.com&search=9876543210&status=Sent
-app.get('/api/history', async (req, res) => {
-  try {
-    const { email, search, status } = req.query;
-    if (!email) return res.status(400).json({ message: "email is required" });
-
-    const query = { email };
-    if (status && (status === 'Sent' || status === 'Failed')) {
-      query.status = status;
+    const { email, amount } = req.body;
+    let user = await User.findOne({ email });
+    if (user) {
+      user.credits = Math.max(0, (user.credits || 0) - (amount || 1));
+      await user.save();
+      res.status(200).json({ credits: user.credits });
+    } else {
+      res.status(404).json({ message: "User not found" });
     }
-    if (search && String(search).trim() !== "") {
-      const s = String(search).trim();
-      query.$or = [
-        { phone: { $regex: s, $options: 'i' } },
-        { message: { $regex: s, $options: 'i' } }
-      ];
-    }
-
-    const records = await MessageHistory.find(query).sort({ createdAt: -1 }).lean();
-    res.status(200).json({ total: records.length, records });
   } catch (error) {
-    console.error('❌ /api/history error:', error);
-    res.status(500).json({ message: "Error fetching message history", error: error.message });
+    res.status(500).json({ message: "Error using credit", error });
   }
 });
 
@@ -883,9 +840,7 @@ app.post('/api/support', async (req, res) => {
     });
     await supportDoc.save();
 
-    const destination = '919943042369'; 
-
-
+    const destination = '919524648478';
     let cleanDest = String(destination).replace(/\D/g, '');
     if (cleanDest.length === 10) {
       cleanDest = '91' + cleanDest;
@@ -969,5 +924,21 @@ app.use((err, req, res, next) => {
     console.error("Express Error:", err);
     res.status(err.status || 500).json({ error: err.message || "Internal Server Error" });
 });
+
+// Scraper API Route
+app.post("/api/scrape-leads", async (req, res) => {
+  try {
+    const { query, location } = req.body;
+    if (!query) {
+      return res.status(400).json({ success: false, message: "Query string is required" });
+    }
+    const leads = await scrapeGoogleMapsLeads(query, location || "");
+    return res.json({ success: true, count: leads.length, leads });
+  } catch (err) {
+    console.error("API Error:", err);
+    return res.status(500).json({ success: false, message: "Scraping failed" });
+  }
+});
+
 
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
